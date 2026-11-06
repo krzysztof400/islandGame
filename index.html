@@ -1,0 +1,435 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Survival on the Island – Simulator</title>
+<style>
+:root{--bg:#f6f5f1;--fg:#1d1d1b;--card:#fff;--mut:#6b6a63;--acc:#8a3b12;--bd:#ddd9cd}
+@media(prefers-color-scheme:dark){:root{--bg:#161614;--fg:#ece9df;--card:#201f1c;--mut:#9a978b;--acc:#e0915f;--bd:#37352f}}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 Georgia,serif}
+main{max-width:760px;margin:0 auto;padding:24px 16px 64px}
+h1{margin:0 0 4px}h2{margin:0 0 8px}h2 small{font-weight:400;color:var(--mut);font-size:.7em;margin-left:8px}
+h3{margin:14px 0 2px;font-size:.8em;text-transform:uppercase;letter-spacing:.06em;color:var(--acc)}
+ul{margin:0;padding-left:20px}.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:16px;margin:14px 0}
+#fields,.row{display:flex;flex-wrap:wrap;gap:12px;margin:12px 0}
+label{display:flex;flex-direction:column;font-size:.85em;color:var(--mut);gap:2px}
+input,select,button{font:inherit;padding:6px 8px;border:1px solid var(--bd);border-radius:6px;background:var(--card);color:var(--fg)}
+input[type=number]{width:110px}input[type=checkbox]{width:auto}
+button{background:var(--acc);color:#fff;border:0;padding:10px 20px;cursor:pointer}.sum{border-color:var(--acc)}
+.hidden{display:none!important}
+</style>
+</head>
+<body>
+<main>
+<h1>Survival on the Island</h1>
+<p style="color:var(--mut)">Each catastrophe can happen only once (max 4 rounds). The group acts as one mind, maximizing expected survivors (exact minimax/expectimax when available, Monte Carlo otherwise).</p>
+<div class="card">
+  <div id="fields"></div>
+  <div class="row">
+    <label>Cannibals<input type="number" min="0" id="c-count"></label>
+    <label>&nbsp;<span><input type="checkbox" id="c-auto" checked> = number of soldiers</span></label>
+    <label>Rounds<input type="number" min="1" id="rounds" value="4" max="4"></label>
+    <label>Opponent<select id="chooser"></select></label>
+  </div>
+  <div id="script-config" class="row hidden" style="border-top:1px solid var(--bd);padding-top:12px">
+    <span style="width:100%;font-size:.85em;color:var(--mut)">Predestined Event Sequence (leave as Random or select unique events):</span>
+    <div id="script-selectors" class="row" style="margin:0"></div>
+  </div>
+  <button id="run">Run simulation</button>
+</div>
+<div id="out"></div>
+</main>
+<script>
+"use strict";
+const ROLES = ['doctor', 'fisher', 'mushroom', 'soldier', 'builder'];
+const LABEL = { doctor: 'Doctor', fisher: 'Fisherman', mushroom: 'Mushroom picker', soldier: 'Soldier', builder: 'Builder' };
+const CAP = { fisher: 5, mushroom: 4, builder: 6 };
+const EVENTS = { fishing: 'Fishing accident', mushroom: 'Mushroom poisoning', building: 'Building accident', cannibals: 'Cannibal attack' };
+const EVENT_LIST = Object.keys(EVENTS);
+const EVENT_ROLE = { fishing: 'fisher', mushroom: 'mushroom', building: 'builder' };
+const noop = () => { };
+const mulberry = (a) => () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+const alive = (s, r) => s.people.filter(p => p.alive && (!r || p.role === r));
+function sample(a, n, rng) { const c = [...a], o = []; while (o.length < n && c.length) o.push(c.splice(Math.floor(rng() * c.length), 1)[0]); return o; }
+const names = (a) => a.map(p => p.name).join(', ') || 'nobody';
+const binom = (n, k) => { if (k < 0 || k > n) return 0; let r = 1; for (let i = 1; i <= k; i++) r = r * (n - k + i) / i; return r; };
+
+// Solver for Vicious (Aggregating worst case)
+function makeSolver(cfg, agg) {
+    const memo = new Map(), R = cfg.rounds;
+    const mz = (k, f) => { let v = memo.get(k); if (v === undefined) { v = f(); memo.set(k, v); } return v; };
+    const sub = (c, i, k = 1) => { const d = [...c]; d[i] -= k; return d; };
+    const sum = (c) => c[0] + c[1] + c[2] + c[3] + c[4];
+    const key = (t, c, m, r, u, x = '') => `${t}${c.join(',')}|${m}|${r}|${u}|${x}`;
+    const comps = (c, k) => {
+        const out = [], tot = binom(sum(c), k);
+        if (tot === 0) return [{ p: 1, kill: [0, 0, 0, 0, 0] }];
+        const rec = (i, left, kill, w) => {
+            if (i === 5) { if (!left) out.push({ p: w / tot, kill: [...kill] }); return; }
+            for (let x = 0; x <= Math.min(c[i], left); x++) {
+                kill[i] = x; rec(i + 1, left - x, kill, w * binom(c[i], x));
+            }
+        };
+        rec(0, k, [0, 0, 0, 0, 0], 1);
+        return out;
+    };
+    const outcomes = (c, e) => {
+        const rl = EVENT_ROLE[e];
+        if (rl) { const i = ROLES.indexOf(rl); return [{ p: 1, kill: [0, 0, 0, 0, 0], idx: i, inj: Math.min(2, c[i]) }]; }
+        const k = Math.min(Math.max(0, cfg.cannibals - c[3]), sum(c));
+        return comps(c, k).map(x => ({ p: x.p, kill: x.kill, idx: 3, inj: Math.min(Math.min(2, c[3]), c[3] - x.kill[3]) }));
+    };
+    const V = (c, m, r, u) => r > R ? sum(c) : sum(c) === 0 ? 0 : mz(key('V', c, m, r, u), () => Math.max(...sacOpts(c, m, r, u).map(o => o.v)));
+    const sacOpts = (c, m, r, u) => [0, 1, 2, 3, 4].filter(i => c[i] > 0).map(i => ({ i, v: A(sub(c, i), m, r, u) }));
+    const A = (c, m, r, u) => {
+        const n = sum(c); if (!n) return 0;
+        const short = 6 * c[4] < n;
+        return 5 * c[1] + 4 * c[2] < n ? [0, 1, 2, 3, 4].reduce((t, i) => t + (c[i] ? c[i] / n * B(sub(c, i), m, r, u, short) : 0), 0) : B(c, m, r, u, short);
+    };
+    const B = (c, m, r, u, short) => {
+        const n = sum(c); if (!n) return 0;
+        if (!short) return E(c, m, r, u);
+        return [0, 1, 2, 3, 4].reduce((t, i) => {
+            if (!c[i]) return t;
+            const o = shelter(c, i, m, r, u); return t + c[i] / n * Math.max(o.die, o.use);
+        }, 0);
+    };
+    const shelter = (c, i, m, r, u) => ({ die: E(sub(c, i), m, r, u), use: m && c[0] > 0 ? E(c, 0, r, u) : -1 });
+    const E = (c, m, r, u) => {
+        if (!sum(c)) return 0;
+        const v = evVals(c, m, r, u).filter(x => !isNaN(x));
+        return v.length ? agg(v) : V(c, m, r + 1, u);
+    };
+    const evVals = (c, m, r, u) => EVENT_LIST.map((e, k) => (u >> k & 1) ? NaN : mz(key('F', c, m, r, u, e), () => outcomes(c, e).reduce((t, o) => {
+        const q = evOpts(c, m, r, u | 1 << k, o.kill, o.idx, o.inj);
+        return t + o.p * Math.max(q.no, q.use);
+    }, 0)));
+    const evOpts = (c, m, r, u2, kill, idx, inj) => {
+        const base = c.map((x, i) => x - kill[i]);
+        return { no: V(sub(base, idx, inj), m, r + 1, u2), use: m && c[0] > 0 && inj > 0 ? V(base, 0, r + 1, u2) : -1 };
+    };
+    return { V, sacOpts, shelter, evVals, evOpts };
+}
+
+// Exact solver for fixed known event sequence
+function makeFixedSolver(cfg, script) {
+    const memo = new Map(), R = cfg.rounds;
+    const mz = (k, f) => { let v = memo.get(k); if (v === undefined) { v = f(); memo.set(k, v); } return v; };
+    const sub = (c, i, k = 1) => { const d = [...c]; d[i] -= k; return d; };
+    const sum = (c) => c[0] + c[1] + c[2] + c[3] + c[4];
+    const key = (t, c, m, r, x = '') => `${t}${c.join(',')}|${m}|${r}|${x}`;
+    const comps = (c, k) => {
+        const out = [], tot = binom(sum(c), k);
+        if (tot === 0) return [{ p: 1, kill: [0, 0, 0, 0, 0] }];
+        const rec = (i, left, kill, w) => {
+            if (i === 5) { if (!left) out.push({ p: w / tot, kill: [...kill] }); return; }
+            for (let x = 0; x <= Math.min(c[i], left); x++) {
+                kill[i] = x; rec(i + 1, left - x, kill, w * binom(c[i], x));
+            }
+        };
+        rec(0, k, [0, 0, 0, 0, 0], 1);
+        return out;
+    };
+    const outcomes = (c, e) => {
+        const rl = EVENT_ROLE[e];
+        if (rl) { const i = ROLES.indexOf(rl); return [{ p: 1, kill: [0, 0, 0, 0, 0], idx: i, inj: Math.min(2, c[i]) }]; }
+        const k = Math.min(Math.max(0, cfg.cannibals - c[3]), sum(c));
+        return comps(c, k).map(x => ({ p: x.p, kill: x.kill, idx: 3, inj: Math.min(Math.min(2, c[3]), c[3] - x.kill[3]) }));
+    };
+    const V = (c, m, r) => r > R ? sum(c) : sum(c) === 0 ? 0 : mz(key('V', c, m, r), () => Math.max(...sacOpts(c, m, r).map(o => o.v)));
+    const sacOpts = (c, m, r) => [0, 1, 2, 3, 4].filter(i => c[i] > 0).map(i => ({ i, v: A(sub(c, i), m, r) }));
+    const A = (c, m, r) => {
+        const n = sum(c); if (!n) return 0;
+        const short = 6 * c[4] < n;
+        return 5 * c[1] + 4 * c[2] < n ? [0, 1, 2, 3, 4].reduce((t, i) => t + (c[i] ? c[i] / n * B(sub(c, i), m, r, short) : 0), 0) : B(c, m, r, short);
+    };
+    const B = (c, m, r, short) => {
+        const n = sum(c); if (!n) return 0;
+        if (!short) return E(c, m, r);
+        return [0, 1, 2, 3, 4].reduce((t, i) => {
+            if (!c[i]) return t;
+            const o = shelter(c, i, m, r); return t + c[i] / n * Math.max(o.die, o.use);
+        }, 0);
+    };
+    const shelter = (c, i, m, r) => ({ die: E(sub(c, i), m, r), use: m && c[0] > 0 ? E(c, 0, r) : -1 });
+    const E = (c, m, r) => {
+        if (!sum(c)) return 0;
+        const e = script[r - 1];
+        return mz(key('F', c, m, r, e), () => outcomes(c, e).reduce((t, o) => {
+            const q = evOpts(c, m, r, o.kill, o.idx, o.inj);
+            return t + o.p * Math.max(q.no, q.use);
+        }, 0));
+    };
+    const evOpts = (c, m, r, kill, idx, inj) => {
+        const base = c.map((x, i) => x - kill[i]);
+        return { no: V(sub(base, idx, inj), m, r + 1), use: m && c[0] > 0 && inj > 0 ? V(base, 0, r + 1) : -1 };
+    };
+    return { V, sacOpts, shelter, evOpts };
+}
+
+const cnt = (s) => ROLES.map(r => alive(s, r).length);
+const fx = (v) => v.toFixed(2);
+const mm = (x) => x.st.medicine ? 1 : 0;
+const T1 = '1 · Sacrifice', T3 = '3 · Resource check', T4 = '4 · Monthly event', T5 = "5 · Doctor's decision", T6 = '6 · Casualties';
+const byId = (x, p) => x.st.people.find(q => q.id === p.id);
+
+const STEPS = [
+    (x, e) => { const d = e.brain.sacrifice(x, e); e.say(T1, d.note); d.p.alive = false; e.say(T1, `${d.p.name} is sacrificed.`); },
+    (x, e) => {
+        const s = x.s, A = (r) => alive(x.st, r).length;
+        s.n = alive(x.st).length; s.food = 5 * A('fisher') + 4 * A('mushroom'); s.shelter = 6 * A('builder');
+        e.say('2 · Work', `${s.n} workers left. Food for ${s.food} (${A('fisher')}×5 fish + ${A('mushroom')}×4 mushrooms), shelter for ${s.shelter} (${A('builder')}×6), ${A('soldier')} soldier(s) on guard.`);
+    },
+    (x, e) => {
+        const s = x.s;
+        if (s.food < s.n) {
+            const v = sample(alive(x.st), 1, e.rng)[0];
+            if (v) { v.alive = false; e.say(T3, `Food shortage (${s.food} < ${s.n}): ${v.name} starves. Medicine cannot help.`); }
+        } else e.say(T3, `Food sufficient (${s.food} ≥ ${s.n}).`);
+
+        if (s.shelter >= s.n) { e.say(T3, `Shelter sufficient (${s.shelter} ≥ ${s.n}).`); return; }
+        const v = sample(alive(x.st), 1, e.rng)[0];
+        if (!v) return;
+        e.say(T3, `Shelter shortage (${s.shelter} < ${s.n}): ${v.name} is injured by exposure.`);
+        if (x.st.medicine && alive(x.st, 'doctor').length) {
+            const d = e.brain.shelter(x, e, v); e.say(T3, d.note);
+            if (d.use) { x.st.medicine = false; e.say(T3, `${v.name} is saved; medicine is gone.`); return; }
+        }
+        v.alive = false; e.say(T3, `${v.name} dies of exposure.`);
+    },
+    (x, e) => {
+        const s = x.s; s.c0 = cnt(x.st); const o = e.opp(x, e);
+        if (o.note) e.say(T4, o.note);
+        e.say(T4, `${EVENTS[o.ev]}.`); x.st.used |= 1 << EVENT_LIST.indexOf(o.ev);
+        s.killed = []; s.injured = [];
+        const role = EVENT_ROLE[o.ev];
+        if (role) {
+            s.injured = sample(alive(x.st, role), 2, e.rng); e.say(T4, `Injured: ${names(s.injured)}.`);
+        } else {
+            const sol = s.c0[3], k = Math.min(Math.max(0, e.cfg.cannibals - sol), alive(x.st).length);
+            e.say(T4, `${e.cfg.cannibals} cannibals attack, ${sol} soldier(s) defend → ${k} break through.`);
+            s.killed = sample(alive(x.st), k, e.rng);
+            if (k) e.say(T4, `Mortally wounded: ${names(s.killed)}.`);
+            s.injured = sample(alive(x.st, 'soldier').filter(p => !s.killed.includes(p)), Math.min(2, sol), e.rng);
+            if (sol) e.say(T4, `Injured defenders: ${names(s.injured)}.`);
+        }
+    },
+    (x, e) => {
+        const s = x.s;
+        if (!s.injured.length) e.say(T5, 'Nobody injured by this event – nothing to treat.');
+        else if (!x.st.medicine) e.say(T5, 'Medicine already used – injured cannot be saved.');
+        else if (!alive(x.st, 'doctor').length) e.say(T5, 'Doctor is dead – medicine is lost.');
+        else {
+            const d = e.brain.doctor(x, e); e.say(T5, d.note);
+            if (d.use) { x.st.medicine = false; e.say(T5, `${names(s.injured)} saved; medicine is gone.`); s.injured = []; }
+        }
+    },
+    (x, e) => { const dead = [...x.s.killed, ...x.s.injured]; dead.forEach(p => p.alive = false); e.say(T6, dead.length ? `Dead: ${names(dead)}.` : 'No casualties this event.'); },
+    (x, e) => e.say('7 · End of round', 'Storms destroy shelters; fish, mushrooms and all other food spoil. Nothing carries over.')
+];
+
+function finish(x, e, i) {
+    for (; i < STEPS.length; i++) STEPS[i](x, e);
+    x.st.round++;
+    while (x.st.round <= e.cfg.rounds && alive(x.st).length) {
+        STEPS.forEach(f => f(x, e)); x.st.round++;
+    }
+}
+
+function heur(st, cfg, rng) {
+    let best = alive(st)[0], bp = 1e9; const n = alive(st).length - 1;
+    for (const r of ROLES) {
+        const g = alive(st, r); if (!g.length) continue;
+        const c = (y) => alive(st, y).length - (y === r ? 1 : 0);
+        const pen = (CAP.fisher * c('fisher') + CAP.mushroom * c('mushroom') < n ? 10 : 0) + (CAP.builder * c('builder') < n ? 10 : 0) + Math.max(0, cfg.cannibals - c('soldier')) * 3 + (r === 'doctor' && st.medicine ? 2 : 0) + rng() * .5;
+        if (pen < bp) { bp = pen; best = g[0]; }
+    }
+    return best;
+}
+
+const DEFAULT = {
+    sacrifice: (x, e) => ({ p: heur(x.st, e.cfg, e.rng), note: '' }),
+    shelter: () => ({ use: false, note: '' }),
+    doctor: (x, e) => { const n = x.s.injured.length; return { use: n >= 2 || (n >= 1 && x.st.round === e.cfg.rounds), note: '' }; }
+};
+
+function evalOption(x, e, apply, from, K = 200) {
+    let t = 0; const base = Math.floor(e.rng() * 2 ** 30);
+    for (let k = 0; k < K; k++) {
+        const c = structuredClone(x); apply(c);
+        finish(c, { ...e, brain: DEFAULT, opp: e.rollOpp, say: noop, rng: mulberry(base + k) }, from);
+        t += alive(c.st).length;
+    }
+    return t / K;
+}
+
+const mcBrain = {
+    sacrifice: (x, e) => {
+        const sc = ROLES.map(r => ({ r, p: alive(x.st, r)[0] })).filter(o => o.p).map(o => ({ ...o, v: evalOption(x, e, c => { byId(c, o.p).alive = false; }, 1) }));
+        const b = sc.reduce((a, c) => c.v > a.v + 1e-9 ? c : a);
+        return { p: b.p, note: 'Monte-Carlo estimate of expected survivors if sacrificing: ' + sc.map(o => `${LABEL[o.r]} ${fx(o.v)}`).join(' · ') };
+    },
+    shelter: (x, e, v) => {
+        const u = evalOption(x, e, c => { c.st.medicine = false; }, 3), d = evalOption(x, e, c => { byId(c, v).alive = false; }, 3);
+        return { use: u > d + 1e-9, note: `Doctor weighs (Monte Carlo): spend medicine on ${v.name} now ${fx(u)} vs save it ${fx(d)}.` };
+    },
+    doctor: (x, e) => {
+        const u = evalOption(x, e, c => { c.st.medicine = false; c.s.injured = []; }, 5), k = evalOption(x, e, () => { }, 5);
+        return { use: u > k + 1e-9, note: `Doctor weighs (Monte Carlo): use medicine ${fx(u)} vs keep it ${fx(k)}.` };
+    }
+};
+
+const exactBrain = (S) => ({
+    sacrifice: x => {
+        const o = S.sacOpts(cnt(x.st), mm(x), x.st.round, x.st.used), b = o.reduce((a, c) => c.v > a.v + 1e-9 ? c : a);
+        return { p: alive(x.st, ROLES[b.i])[0], note: 'Minimax value (expected survivors) if sacrificing: ' + o.map(q => `${LABEL[ROLES[q.i]]} ${fx(q.v)}`).join(' · ') };
+    },
+    shelter: (x, e, v) => {
+        const o = S.shelter(cnt(x.st), ROLES.indexOf(v.role), mm(x), x.st.round, x.st.used);
+        return { use: o.use > o.die + 1e-9, note: `Doctor weighs: spend medicine now ${fx(o.use)} vs save it ${fx(o.die)}.` };
+    },
+    doctor: x => {
+        const s = x.s, n = s.injured.length, kv = ROLES.map(r => s.killed.filter(p => p.role === r).length);
+        const o = S.evOpts(s.c0, mm(x), x.st.round, x.st.used, kv, n ? ROLES.indexOf(s.injured[0].role) : 3, n);
+        return { use: o.use > o.no + 1e-9, note: `Doctor weighs: use medicine ${fx(o.use)} vs keep it ${fx(o.no)}.` };
+    }
+});
+
+const fixedExactBrain = (S) => ({
+    sacrifice: x => {
+        const o = S.sacOpts(cnt(x.st), mm(x), x.st.round), b = o.reduce((a, c) => c.v > a.v + 1e-9 ? c : a);
+        return { p: alive(x.st, ROLES[b.i])[0], note: 'Exact expectimax value if sacrificing: ' + o.map(q => `${LABEL[ROLES[q.i]]} ${fx(q.v)}`).join(' · ') };
+    },
+    shelter: (x, e, v) => {
+        const o = S.shelter(cnt(x.st), ROLES.indexOf(v.role), mm(x), x.st.round);
+        return { use: o.use > o.die + 1e-9, note: `Doctor weighs: spend medicine now ${fx(o.use)} vs save it ${fx(o.die)}.` };
+    },
+    doctor: x => {
+        const s = x.s, n = s.injured.length, kv = ROLES.map(r => s.killed.filter(p => p.role === r).length);
+        const o = S.evOpts(s.c0, mm(x), x.st.round, kv, n ? ROLES.indexOf(s.injured[0].role) : 3, n);
+        return { use: o.use > o.no + 1e-9, note: `Doctor weighs: use medicine ${fx(o.use)} vs keep it ${fx(o.no)}.` };
+    }
+});
+
+const viciousOpp = (S) => x => {
+    const v = S.evVals(cnt(x.st), mm(x), x.st.round, x.st.used);
+    let b = -1; v.forEach((q, i) => { if (!isNaN(q) && (b < 0 || q < v[b])) b = i; });
+    if (b < 0) b = 0;
+    return { ev: EVENT_LIST[b], note: 'Opponent minimises (unused events only) – expected survivors: ' + EVENT_LIST.map((q, i) => `${EVENTS[q]} ${isNaN(v[i]) ? 'used' : fx(v[i])}`).join(' · ') };
+};
+
+const uniformOpp = (x, e) => {
+    const pool = EVENT_LIST.filter((_, k) => !(x.st.used >> k & 1));
+    const p = pool.length ? pool : EVENT_LIST;
+    return { ev: p[Math.floor(e.rng() * p.length)] };
+};
+const scriptOpp = (sc) => x => ({ ev: sc[x.st.round - 1] });
+
+function getCustomScript(cfg, rng) {
+    const rounds = cfg.rounds;
+    const drawn = sample(EVENT_LIST, rounds, rng);
+    const custom = cfg.customScript || [];
+    const used = new Set();
+    const result = [];
+    for (let i = 0; i < rounds; i++) {
+        let ev = custom[i];
+        if (ev && EVENT_LIST.includes(ev) && !used.has(ev)) {
+            used.add(ev); result.push(ev);
+        } else { result.push(null); }
+    }
+    const remaining = EVENT_LIST.filter(e => !used.has(e));
+    for (let i = 0; i < rounds; i++) {
+        if (!result[i]) result[i] = remaining.shift() || drawn[i];
+    }
+    return result;
+}
+
+const MODES = {
+    vicious: { label: 'Vicious – minimax on both sides (exact)', make: cfg => { const S = makeSolver(cfg, v => Math.min(...v)); return { brain: exactBrain(S), opp: viciousOpp(S), rollOpp: uniformOpp, solver: S }; } },
+    random: { label: 'Random events – island unaware (Monte Carlo)', make: () => ({ brain: mcBrain, opp: uniformOpp, rollOpp: uniformOpp }) },
+    'fixed-known': { label: 'Predestined events – island knows them (exact expectimax)', make: (c, r) => { const sc = getCustomScript(c, r); const S = makeFixedSolver(c, sc); return { brain: fixedExactBrain(S), opp: scriptOpp(sc), rollOpp: scriptOpp(sc), script: sc, solver: S }; } },
+    'fixed-hidden': { label: 'Predestined events – island unaware (Monte Carlo)', make: (c, r) => { const sc = getCustomScript(c, r); return { brain: mcBrain, opp: scriptOpp(sc), rollOpp: uniformOpp, script: sc }; } },
+};
+
+function simulate(cfg0) {
+    const cfg = { ...cfg0, rounds: Math.min(4, Math.max(1, cfg0.rounds)) };
+    const rng = mulberry(Date.now() & 0x7fffffff);
+    let id = 0;
+    const st = { people: [], medicine: true, round: 1, used: 0 };
+    for (const r of ROLES) for (let i = 1; i <= cfg.counts[r]; i++) st.people.push({ id: id++, role: r, name: `${LABEL[r]} ${i}`, alive: true });
+    const total = st.people.length, reports = [], md = MODES[cfg.chooser].make(cfg, rng);
+    const x = { st, s: { n: 0, food: 0, shelter: 0, c0: [], injured: [], killed: [] } };
+    const plan = md.solver ? md.solver.V(cnt(st), 1, 1, ...(cfg.chooser === 'fixed-known' ? [] : [0])) : null;
+    for (; st.round <= cfg.rounds && alive(st).length; st.round++) {
+        const rep = { round: st.round, before: alive(st).length, after: 0, steps: [] };
+        const say = (t, m) => { let s = rep.steps.find(q => q.title === t); if (!s) rep.steps.push(s = { title: t, lines: [] }); s.lines.push(m); };
+        const e = { cfg, brain: md.brain, opp: md.opp, rollOpp: md.rollOpp, rng, say };
+        STEPS.forEach(f => f(x, e));
+        rep.after = alive(st).length;
+        reports.push(rep);
+    }
+    return { reports, survivors: alive(st), total, plan, script: md.script };
+}
+
+// UI Setup
+const $ = (id) => document.getElementById(id);
+const DEF = { doctor: 1, fisher: 3, mushroom: 3, soldier: 4, builder: 3 };
+
+$('fields').innerHTML = ROLES.map(r => `<label>${LABEL[r]}s<input type="number" min="0" id="n-${r}" value="${DEF[r]}"></label>`).join('');
+$('chooser').innerHTML = Object.entries(MODES).map(([k, v]) => `<option value="${k}">${v.label}</option>`).join('');
+
+function updateScriptUI() {
+    const isPredestined = $('chooser').value.startsWith('fixed');
+    const rounds = Math.min(4, Math.max(1, +$('rounds').value | 0));
+    const container = $('script-config');
+    const selectors = $('script-selectors');
+
+    if (!isPredestined) {
+        container.classList.add('hidden');
+        return;
+    }
+    container.classList.remove('hidden');
+
+    let html = '';
+    for (let i = 1; i <= rounds; i++) {
+        html += `<label>R${i} Event<select id="script-r${i}">
+            <option value="">(Random / Auto)</option>
+            ${EVENT_LIST.map(e => `<option value="${e}">${EVENTS[e]}</option>`).join('')}
+        </select></label>`;
+    }
+    selectors.innerHTML = html;
+}
+
+const syncC = () => {
+    $('c-count').disabled = $('c-auto').checked;
+    if ($('c-auto').checked) $('c-count').value = $('n-soldier').value;
+};
+
+['c-auto', 'n-soldier'].forEach(i => $(i).addEventListener('input', syncC));
+$('chooser').addEventListener('change', updateScriptUI);
+$('rounds').addEventListener('input', updateScriptUI);
+syncC();
+updateScriptUI();
+
+$('run').addEventListener('click', () => {
+    const counts = {};
+    ROLES.forEach(r => counts[r] = Math.max(0, +$('n-' + r).value | 0));
+    const rounds = Math.min(4, Math.max(1, +$('rounds').value | 0));
+    const customScript = [];
+    if ($('chooser').value.startsWith('fixed')) {
+        for (let i = 1; i <= rounds; i++) {
+            const el = $(`script-r${i}`);
+            if (el && el.value) customScript.push(el.value);
+            else customScript.push(null);
+        }
+    }
+    const cfg = { counts, cannibals: Math.max(0, +$('c-count').value | 0), rounds, chooser: $('chooser').value, customScript };
+    const { reports, survivors, total, plan, script } = simulate(cfg);
+    $('out').innerHTML = reports.map(r => `<section class="card"><h2>Month ${r.round} <small>${r.before} → ${r.after} alive</small></h2>` +
+        r.steps.map(s => `<h3>${s.title}</h3><ul>${s.lines.map(l => `<li>${l}</li>`).join('')}</ul>`).join('') + `</section>`).join('') +
+        `<section class="card sum"><h2>${survivors.length} of ${total} survived to the rescue ship</h2><p>${plan !== null ? `Exact expected survivors at the start: ${plan.toFixed(2)}. ` : ''}${script ? `Predestined events: ${script.map((e, i) => `Month ${i + 1}: ${EVENTS[e]}`).join('; ')}.` : ''}</p><p>${survivors.length ? survivors.map(p => p.name).join(', ') : 'Nobody survived.'}</p></section>`;
+});
+</script>
+</body>
+</html>
